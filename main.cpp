@@ -1,7 +1,6 @@
 #include "util/https_download.h"
 #include "util/extract_tar_gz.h"
-#include <boost/property_tree/ptree.hpp>
-#include <boost/property_tree/json_parser.hpp>
+#include <nlohmann/json.hpp>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -13,9 +12,10 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 // -------------------------------------------------------------------
-// Logging helper (always flush)
+// Logging
 // -------------------------------------------------------------------
 static void log(const std::string& msg) {
     std::cerr << msg << std::endl;
@@ -54,6 +54,87 @@ static bool run_process(const fs::path &exe, char *const argv[], const std::stri
 }
 
 // -------------------------------------------------------------------
+// Split https://host/path into host+path
+// -------------------------------------------------------------------
+static void split_url(const std::string& fullUrl, std::string& host, std::string& path) {
+    if (fullUrl.find("https://") == 0) {
+        auto noScheme = fullUrl.substr(8);
+        auto slashPos = noScheme.find('/');
+        host = noScheme.substr(0, slashPos);
+        path = noScheme.substr(slashPos);
+    } else {
+        throw std::runtime_error("Unsupported URL: " + fullUrl);
+    }
+}
+
+// -------------------------------------------------------------------
+// Pick channel URL (prefer LTS + active, fallback STS)
+// -------------------------------------------------------------------
+static std::string pick_channel_url(const json& index) {
+    std::string result;
+    int bestMajor = -1;
+
+    for (auto& entry : index["releases-index"]) {
+        std::string type  = entry.value("release-type", "");
+        std::string phase = entry.value("support-phase", "");
+        std::string ver   = entry.value("channel-version", "");
+        std::string url   = entry.value("releases.json", "");
+
+        log("Channel candidate: " + ver + " " + type + " " + phase);
+        if (type == "lts" && phase == "active" && !ver.empty() && !url.empty()) {
+            int major = std::stoi(ver.substr(0, ver.find('.')));
+            if (major > bestMajor) {
+                bestMajor = major;
+                result = url;
+            }
+        }
+    }
+
+    if (!result.empty()) {
+        log("Selected active LTS channel: " + result);
+        return result;
+    }
+
+    log("No active LTS found, trying STS...");
+    for (auto& entry : index["releases-index"]) {
+        std::string type = entry.value("release-type", "");
+        std::string ver  = entry.value("channel-version", "");
+        std::string url  = entry.value("releases.json", "");
+        if (type == "sts" && !url.empty()) {
+            log("Fallback to STS " + ver);
+            return url;
+        }
+    }
+
+    return {};
+}
+
+// -------------------------------------------------------------------
+// Pick SDK/runtime asset (prefer SDK for linux-x64)
+// -------------------------------------------------------------------
+static std::string pick_asset_url(const json& channel, const std::string& targetVersion,
+                                  const std::string& rid = "linux-x64") {
+    for (auto& release : channel["releases"]) {
+        std::string ver = release.value("release-version", "");
+        if (ver == targetVersion) {
+            if (release.contains("sdk") && release["sdk"].contains("files")) {
+                for (auto& f : release["sdk"]["files"]) {
+                    if (f.value("rid", "") == rid)
+                        return f.value("url", "");
+                }
+            }
+            if (release.contains("runtime") && release["runtime"].contains("files")) {
+                for (auto& f : release["runtime"]["files"]) {
+                    if (f.value("rid", "") == rid)
+                        return f.value("url", "");
+                }
+            }
+        }
+    }
+    return {};
+}
+
+// -------------------------------------------------------------------
 // Main
 // -------------------------------------------------------------------
 int main(int argc, char* argv[]) {
@@ -61,12 +142,9 @@ int main(int argc, char* argv[]) {
         log("dotnet bootstrapper started");
 
         fs::path projectRoot = fs::current_path();
-        log("Project root: " + projectRoot.string());
-
         fs::path dotnetDir   = projectRoot / ".dotnet";
         fs::create_directories(dotnetDir);
 
-        // Central store
         fs::path storeDir    = fs::path(getenv("HOME")) / ".local/share/run-dotnet";
         fs::path archivesDir = storeDir / "archives";
         fs::path versionsDir = storeDir / "versions";
@@ -75,155 +153,88 @@ int main(int argc, char* argv[]) {
 
         std::string pinnedVersion;
         int dotnetArgStart = 1;
-
         if (argc > 1) {
             std::string arg1 = argv[1];
             if (isdigit(arg1[0])) {
                 pinnedVersion = arg1;
                 dotnetArgStart = 2;
-                log("Pinned version arg detected: " + pinnedVersion);
+                log("Pinned version: " + pinnedVersion);
             }
         }
 
-        // ---- Fetch releases-index.json
-        log("Fetching releases-index.json ...");
-        std::string jsonStr = https_get_string(
+        // ---- Fetch release index
+        std::string idxStr = https_get_string(
             "dotnetcli.blob.core.windows.net",
             "/dotnet/release-metadata/releases-index.json");
-        log("Fetched releases-index.json, size=" + std::to_string(jsonStr.size()));
+        json index = json::parse(idxStr);
 
-        std::stringstream ss(jsonStr);
-        boost::property_tree::ptree pt;
-        boost::property_tree::read_json(ss, pt);
-
-        std::string targetVersion;
-
-        if (!pinnedVersion.empty()) {
-            targetVersion = pinnedVersion;
-            log("Using pinned .NET version: " + targetVersion);
-        } else {
-            log("Selecting latest LTS channel...");
-            std::string releaseChannelUrl;
-            int bestMajor = -1;
-
-            for (auto &channel : pt.get_child("releases-index")) {
-                try {
-                    auto releaseTypeOpt = channel.second.get_optional<std::string>("release-type");
-                    auto chanVerOpt     = channel.second.get_optional<std::string>("channel-version");
-                    auto supportOpt     = channel.second.get_optional<std::string>("support-phase");
-
-                    std::string url;
-                    for (auto &field : channel.second) {
-                        if (field.first == "releases.json") {
-                            url = field.second.get_value<std::string>();
-                            break;
-                        }
-                    }
-
-                    if (releaseTypeOpt && *releaseTypeOpt == "lts" && !url.empty() && chanVerOpt) {
-                        if (supportOpt && *supportOpt == "eol") continue; // skip dead LTS
-
-                        int major = std::stoi(chanVerOpt->substr(0, chanVerOpt->find('.')));
-                        if (major > bestMajor) {
-                            bestMajor = major;
-                            releaseChannelUrl = url;
-                        }
-                    }
-                }
-                catch (const std::exception &ex) {
-                    log(std::string("Error parsing channel: ") + ex.what());
-                }
-            }
-
-            if (releaseChannelUrl.empty()) {
-                log("No active LTS found, trying STS...");
-                for (auto &channel : pt.get_child("releases-index")) {
-                    auto releaseTypeOpt = channel.second.get_optional<std::string>("release-type");
-                    auto chanVerOpt     = channel.second.get_optional<std::string>("channel-version");
-
-                    std::string url;
-                    for (auto &field : channel.second) {
-                        if (field.first == "releases.json") {
-                            url = field.second.get_value<std::string>();
-                            break;
-                        }
-                    }
-
-                    if (releaseTypeOpt && *releaseTypeOpt == "sts" && !url.empty() && chanVerOpt) {
-                        releaseChannelUrl = url;
-                        log("Falling back to STS channel " + *chanVerOpt);
-                        break;
-                    }
-                }
-            }
-
-            if (releaseChannelUrl.empty()) {
-                log("Could not locate valid channel in releases-index.json");
+        std::string channelUrl;
+        if (pinnedVersion.empty()) {
+            channelUrl = pick_channel_url(index);
+            if (channelUrl.empty()) {
+                log("Could not determine channel URL");
                 return 1;
             }
-            log("Channel metadata URL: " + releaseChannelUrl);
-
-            // Strip https://
-            if (releaseChannelUrl.find("https://") == 0)
-                releaseChannelUrl = releaseChannelUrl.substr(8);
-
-            auto slashPos = releaseChannelUrl.find('/');
-            std::string host = releaseChannelUrl.substr(0, slashPos);
-            std::string path = releaseChannelUrl.substr(slashPos);
-
-            log("Fetching channel JSON from " + host + path);
-            std::string relJson = https_get_string(host, path);
-            log("Fetched channel releases.json, size=" + std::to_string(relJson.size()));
-
-            std::stringstream ss2(relJson);
-            boost::property_tree::ptree pt2;
-            boost::property_tree::read_json(ss2, pt2);
-
-            targetVersion = pt2.get<std::string>("latest-release");
-            log("Latest channel release: " + targetVersion);
         }
 
-        std::string filename = "dotnet-sdk-" + targetVersion + "-linux-x64.tar.gz";
-        std::string target   = "/dotnet/Sdk/" + targetVersion + "/" + filename;
+        // ---- Fetch channel JSON
+        std::string targetVersion = pinnedVersion;
+        json channelJson;
+        if (pinnedVersion.empty()) {
+            std::string host, path;
+            split_url(channelUrl, host, path);
+            std::string channelStr = https_get_string(host, path);
+            channelJson = json::parse(channelStr);
+            targetVersion = channelJson.value("latest-release", "");
+            log("Latest release in channel: " + targetVersion);
+        }
 
-        fs::path archivePath = archivesDir / filename;
+        // ---- Pick asset URL
+        std::string downloadUrl;
+        if (!pinnedVersion.empty()) {
+            log("Pinned version only provided — downloads based on pinned URL unsupported in this demo");
+            return 1;
+        } else {
+            downloadUrl = pick_asset_url(channelJson, targetVersion);
+            if (downloadUrl.empty()) {
+                log("No asset found for " + targetVersion);
+                return 1;
+            }
+        }
+
+        log("Download URL: " + downloadUrl);
+        std::string host, path;
+        split_url(downloadUrl, host, path);
+
+        fs::path archivePath = archivesDir / fs::path(path).filename();
         fs::path extractDir  = versionsDir / targetVersion;
         fs::path dotnetBin   = extractDir / "dotnet";
 
         if (!fs::exists(archivePath)) {
-            log("Downloading archive from " + target);
-            https_download("dotnetcli.azureedge.net", target, archivePath);
-            log("Download complete: " + archivePath.string());
+            log("Downloading archive...");
+            https_download(host, path, archivePath);
         }
         if (!fs::exists(dotnetBin)) {
             fs::create_directories(extractDir);
-            log("Extracting archive...");
             if (!extract_tar_gz(archivePath.string(), extractDir.string())) {
                 log("Extraction failed");
                 return 1;
             }
-            log("Extraction finished");
         }
 
-        // Resync .dotnet symlinks
-        log("Wiring .dotnet symlinks...");
-        for (auto &e : fs::directory_iterator(dotnetDir)) {
+        // ---- Update symlinks
+        for (auto &e : fs::directory_iterator(dotnetDir))
             fs::remove_all(e.path());
-        }
-        for (auto &entry : fs::directory_iterator(extractDir)) {
-            fs::path name = entry.path().filename();
-            fs::path dest = dotnetDir / name;
-            if (fs::exists(dest) || fs::is_symlink(dest)) fs::remove_all(dest);
-            fs::create_symlink(entry.path(), dest);
-        }
+        for (auto &entry : fs::directory_iterator(extractDir))
+            fs::create_symlink(entry.path(), dotnetDir / entry.path().filename());
 
         fs::path projectDotnetBin = dotnetDir / "dotnet";
         if (!fs::exists(projectDotnetBin)) {
-            log("dotnet binary not found in .dotnet");
+            log("dotnet binary not found after extraction");
             return 1;
         }
 
-        // Restore if .csproj found
+        // ---- Run dotnet restore if csproj found
         fs::path csproj;
         for (auto &entry : fs::directory_iterator(projectRoot)) {
             if (entry.path().extension() == ".csproj") {
@@ -231,10 +242,7 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
-
         if (!csproj.empty()) {
-            log("Found csproj: " + csproj.string());
-            log("Running dotnet restore ...");
             char* restoreArgs[] = {
                 const_cast<char*>(projectDotnetBin.c_str()),
                 const_cast<char*>("restore"),
@@ -242,27 +250,23 @@ int main(int argc, char* argv[]) {
                 nullptr
             };
             if (!run_process(projectDotnetBin, restoreArgs, "dotnet restore")) {
-                log("dotnet restore failed");
                 return 1;
             }
         }
 
-        // If no args passed
+        // ---- Run user arguments
         if (argc <= dotnetArgStart) {
             log(std::string("Usage: ") + argv[0] + " [X.Y.Z] <args to dotnet>");
             return 1;
         }
 
-        // Run user dotnet command
-        log("Invoking user command via .dotnet/dotnet");
         std::vector<char*> newArgs;
         newArgs.push_back(const_cast<char*>(projectDotnetBin.c_str()));
         for (int i = dotnetArgStart; i < argc; i++)
             newArgs.push_back(argv[i]);
         newArgs.push_back(nullptr);
 
-        bool ok = run_process(projectDotnetBin, newArgs.data(), "dotnet main");
-        return ok ? 0 : 1;
+        return run_process(projectDotnetBin, newArgs.data(), "dotnet main") ? 0 : 1;
     }
     catch (const std::exception &e) {
         log(std::string("Error: ") + e.what());
