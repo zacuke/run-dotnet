@@ -26,7 +26,7 @@ static void log(const std::string& msg) {
 // Fork/exec wrapper
 // -------------------------------------------------------------------
 static bool run_process(const fs::path &exe, char *const argv[], const std::string &label) {
-    log("Launching process: " + label + " [" + exe.string() + "]");
+    //log("Launching process: " + label + " [" + exe.string() + "]");
     pid_t pid = fork();
     if (pid == 0) {
         execv(exe.c_str(), argv);
@@ -80,7 +80,7 @@ static std::string pick_channel_url(const json& index) {
         std::string ver   = entry.value("channel-version", "");
         std::string url   = entry.value("releases.json", "");
 
-        log("Channel candidate: " + ver + " " + type + " " + phase);
+        //log("Channel candidate: " + ver + " " + type + " " + phase);
         if (type == "lts" && phase == "active" && !ver.empty() && !url.empty()) {
             int major = std::stoi(ver.substr(0, ver.find('.')));
             if (major > bestMajor) {
@@ -91,7 +91,7 @@ static std::string pick_channel_url(const json& index) {
     }
 
     if (!result.empty()) {
-        log("Selected active LTS channel: " + result);
+       // log("Selected active LTS channel: " + result);
         return result;
     }
 
@@ -112,25 +112,44 @@ static std::string pick_channel_url(const json& index) {
 // -------------------------------------------------------------------
 // Pick SDK/runtime asset (prefer SDK for linux-x64)
 // -------------------------------------------------------------------
-static std::string pick_asset_url(const json& channel, const std::string& targetVersion,
+static std::string pick_asset_url(const json& channel,
+                                  const std::string& targetVersion,
                                   const std::string& rid = "linux-x64") {
-    for (auto& release : channel["releases"]) {
-        std::string ver = release.value("release-version", "");
-        if (ver == targetVersion) {
-            if (release.contains("sdk") && release["sdk"].contains("files")) {
-                for (auto& f : release["sdk"]["files"]) {
-                    if (f.value("rid", "") == rid)
-                        return f.value("url", "");
-                }
-            }
-            if (release.contains("runtime") && release["runtime"].contains("files")) {
-                for (auto& f : release["runtime"]["files"]) {
-                    if (f.value("rid", "") == rid)
-                        return f.value("url", "");
+    auto pickFile = [&](const json& files, const std::string& label) -> std::string {
+        for (auto& f : files) {
+            std::string fRid  = f.value("rid", "");
+            std::string fUrl  = f.value("url", "");
+            std::string fName = f.value("name", "");
+            std::string fType = f.value("file-type", "");
+            // prefer .tar.gz that matches rid
+            if (fRid == rid && !fUrl.empty()) {
+                if (fType == "installer" || fName.find(".tar.gz") != std::string::npos) {
+                    log("Selected " + label + " asset: " + fName);
+                    return fUrl;
                 }
             }
         }
+        return {};
+    };
+
+    for (auto& release : channel["releases"]) {
+        std::string ver = release.value("release-version", "");
+        if (ver != targetVersion) continue;
+
+        // Prefer SDK
+        if (release.contains("sdk") && release["sdk"].contains("files")) {
+            std::string url = pickFile(release["sdk"]["files"], "SDK");
+            if (!url.empty()) return url;
+        }
+
+        // Otherwise try runtime
+        if (release.contains("runtime") && release["runtime"].contains("files")) {
+            std::string url = pickFile(release["runtime"]["files"], "runtime");
+            if (!url.empty()) return url;
+        }
     }
+
+    log("pick_asset_url: No matching asset found for version " + targetVersion + " and rid " + rid);
     return {};
 }
 
@@ -180,21 +199,69 @@ int main(int argc, char* argv[]) {
         // ---- Fetch channel JSON
         std::string targetVersion = pinnedVersion;
         json channelJson;
-        if (pinnedVersion.empty()) {
+ 
+
+        // ---- Pick asset URL
+        std::string downloadUrl;
+ 
+        if (!pinnedVersion.empty()) {
+            // ---- Figure out major from pinned (e.g. "10" -> "10")
+            std::string majorStr = pinnedVersion.substr(0, pinnedVersion.find('.'));
+
+            // Find matching channel in releases-index
+            std::string pinnedChannelUrl;
+            for (auto& entry : index["releases-index"]) {
+                std::string chanVer = entry.value("channel-version", "");
+                if (chanVer.rfind(majorStr, 0) == 0) { // starts with major
+                    pinnedChannelUrl = entry.value("releases.json", "");
+                    break;
+                }
+            }
+
+            if (pinnedChannelUrl.empty()) {
+                log("No channel found for major " + majorStr);
+                return 1;
+            }
+
+            std::string host, path;
+            split_url(pinnedChannelUrl, host, path);
+            std::string channelStr = https_get_string(host, path);
+            channelJson = json::parse(channelStr);
+
+            // Pick target version:
+            // If pinned is just "10" → resolve to channelJson["latest-release"]
+            if (pinnedVersion.find('.') == std::string::npos) {
+                pinnedVersion = channelJson.value("latest-release", "");
+                log("Resolved major " + majorStr + " to latest " + pinnedVersion);
+            }
+            // If pinned is "10.0" → find latest patch in that band
+            else if (std::count(pinnedVersion.begin(), pinnedVersion.end(), '.') == 1) {
+                std::string best;
+                for (auto& release : channelJson["releases"]) {
+                    std::string relVer = release.value("release-version", "");
+                    if (relVer.rfind(pinnedVersion + ".", 0) == 0) {
+                        if (best.empty() || relVer > best) best = relVer;
+                    }
+                }
+                if (!best.empty()) {
+                    pinnedVersion = best;
+                    log("Resolved " + pinnedVersion + ".* to " + best);
+                }
+            }
+            // else exact match assumed
+
+            downloadUrl = pick_asset_url(channelJson, pinnedVersion);
+            if (downloadUrl.empty()) {
+                log("No asset found for pinned " + pinnedVersion);
+                return 1;
+            }
+        } else {
+            // Original non-pinned path
             std::string host, path;
             split_url(channelUrl, host, path);
             std::string channelStr = https_get_string(host, path);
             channelJson = json::parse(channelStr);
             targetVersion = channelJson.value("latest-release", "");
-            log("Latest release in channel: " + targetVersion);
-        }
-
-        // ---- Pick asset URL
-        std::string downloadUrl;
-        if (!pinnedVersion.empty()) {
-            log("Pinned version only provided — downloads based on pinned URL unsupported in this demo");
-            return 1;
-        } else {
             downloadUrl = pick_asset_url(channelJson, targetVersion);
             if (downloadUrl.empty()) {
                 log("No asset found for " + targetVersion);
@@ -202,7 +269,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        log("Download URL: " + downloadUrl);
+       // log("Download URL: " + downloadUrl);
         std::string host, path;
         split_url(downloadUrl, host, path);
 
@@ -211,7 +278,7 @@ int main(int argc, char* argv[]) {
         fs::path dotnetBin   = extractDir / "dotnet";
 
         if (!fs::exists(archivePath)) {
-            log("Downloading archive...");
+            //log("Downloading archive...");
             https_download(host, path, archivePath);
         }
         if (!fs::exists(dotnetBin)) {

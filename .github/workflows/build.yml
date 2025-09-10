@@ -1,21 +1,19 @@
-name: Build and Release run-node
+name: Build and Release 
 
 on:
   push:
-    branches: [ master ]   # "on checkin"
+    branches: [ master ]
 
 permissions:
-  contents: write         # needed for creating release + uploading assets
+  contents: write
   packages: write
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: ${{ github.repository_owner }}/run-node
+  APP_NAME: run-dotnet
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}/run-dotnet
 
 jobs:
-  # ------------------------------------------------------------
-  # Step 0: Create Release with incremented tag
-  # ------------------------------------------------------------
   create-release:
     runs-on: ubuntu-latest
     outputs:
@@ -24,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # fetch full history
+          fetch-depth: 0
 
       - name: Fetch all tags
         run: git fetch --tags
@@ -50,7 +48,6 @@ jobs:
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
           tag="${{ steps.bump_tag.outputs.tag }}"
-
           if git ls-remote --tags origin | grep -q "refs/tags/$tag"; then
             echo "Tag $tag already exists on remote, skipping creation."
           else
@@ -69,9 +66,6 @@ jobs:
           draft: false
           prerelease: false
 
-  # ------------------------------------------------------------
-  # Step 1: Build & push builder images
-  # ------------------------------------------------------------
   build-builder-images:
     needs: create-release
     runs-on: ubuntu-latest
@@ -107,9 +101,6 @@ jobs:
           cache-from: type=registry,ref=${{ steps.vars.outputs.CACHE }}
           cache-to: type=registry,ref=${{ steps.vars.outputs.CACHE }},mode=max
 
-  # ------------------------------------------------------------
-  # Step 2: Compile binaries
-  # ------------------------------------------------------------
   build-multi-docker:
     needs: build-builder-images
     runs-on: ubuntu-latest
@@ -125,17 +116,14 @@ jobs:
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}
           docker pull $IMAGE
           docker run --rm -v $(pwd):/src -w /src $IMAGE \
-            bash -c "./build.sh && cp ./.build/run-node run-node-ubuntu${{ matrix.version }}"
+            bash -c "./build.sh && cp ./.build/${{ env.APP_NAME }} ${{ env.APP_NAME }}-ubuntu${{ matrix.version }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: run-node-binaries-${{ matrix.version }}
-          path: run-node-ubuntu${{ matrix.version }}
+          name: ${{ env.APP_NAME }}-binaries-${{ matrix.version }}
+          path: ${{ env.APP_NAME }}-ubuntu${{ matrix.version }}
           retention-days: 5
 
-  # ------------------------------------------------------------
-  # Step 3: Attach binaries to the Release
-  # ------------------------------------------------------------
   release-assets:
     needs: [create-release, build-multi-docker]
     runs-on: ubuntu-latest
@@ -147,7 +135,7 @@ jobs:
       - name: Download binary artifact
         uses: actions/download-artifact@v4
         with:
-          name: run-node-binaries-${{ matrix.version }}
+          name: ${{ env.APP_NAME }}-binaries-${{ matrix.version }}
           path: ./release-bin
 
       - name: Upload ${{ matrix.version }} asset
@@ -156,6 +144,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./release-bin/run-node-ubuntu${{ matrix.version }}
-          asset_name: run-node-ubuntu${{ matrix.version }}
+          asset_path: ./release-bin/${{ env.APP_NAME }}-ubuntu${{ matrix.version }}
+          asset_name: ${{ env.APP_NAME }}-ubuntu${{ matrix.version }}
           asset_content_type: application/octet-stream
