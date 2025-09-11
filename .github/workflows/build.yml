@@ -116,7 +116,7 @@ jobs:
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}
           docker pull $IMAGE
           docker run --rm -v $(pwd):/src -w /src $IMAGE \
-            bash -c "./build.sh && cp ./.build/${{ env.APP_NAME }} ${{ env.APP_NAME }}-ubuntu${{ matrix.version }}"
+            bash -c "dos2unix build.sh && bash build.sh && cp ./.build/${{ env.APP_NAME }} ${{ env.APP_NAME }}-ubuntu${{ matrix.version }}"
 
       - uses: actions/upload-artifact@v4
         with:

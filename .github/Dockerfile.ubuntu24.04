@@ -8,4 +8,5 @@ RUN apt-get update \
     ca-certificates \
     liblzma-dev \
     libarchive-dev \
+    dos2unix \
  && rm -rf /var/lib/apt/lists/*
