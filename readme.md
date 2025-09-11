@@ -1,6 +1,6 @@
 # run-node
 
-Run **Node.js** version for your project without installing it system-wide.  
+Run **dotnet** version for your project without installing it system-wide.  
 By default it uses the latest **LTS**, or you can pin to a specific version.
 
 ## Build
@@ -13,6 +13,6 @@ Or use [github-exec](https://github.com/zacuke/github-exec) to run this as part 
 
 ## Usage
 ```bash
-./run-node server.js         # run with latest LTS
-./run-node v20.11.1 server.js   # pin to specific version
+./run-dotnet run Program.cs      
+./run-dotnet 10  run Program.cs   # pin to specific version
 ```
