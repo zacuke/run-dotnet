@@ -349,29 +349,17 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        // ----------------------------------------------------
-        // Ensure PATH and DOTNET_ROOT are set for child processes
-        // EF/SDK tools spawn "dotnet" again, so they must see it
-        // ----------------------------------------------------
-        std::string oldPath = getenv("PATH") ? getenv("PATH") : "";
-        std::string binDir  = projectDotnetBin.parent_path().string();
-        std::string newPath = binDir + ":" + oldPath;
+        // projectDotnetBin points to .../.dotnet/dotnet
+        std::string dotnetRoot = projectDotnetBin.parent_path().string();
+
+        // DOTNET_ROOT=<repo>/.dotnet
+        setenv("DOTNET_ROOT", dotnetRoot.c_str(), 1);
+
+        // PATH=<repo>/.dotnet:$PATH
+        const char* oldPath = getenv("PATH");
+        std::string newPath = dotnetRoot + ":" + (oldPath ? oldPath : "");
         setenv("PATH", newPath.c_str(), 1);
 
-        // DOTNET_ROOT should point to the folder containing 'dotnet'
-        setenv("DOTNET_ROOT", binDir.c_str(), 1);
-
-        // ----------------------------------------------------
-        // Redirect global tool installs into project-local .dotnet/tools
-        // ----------------------------------------------------
-        fs::path toolsDir = dotnetDir / "tools";
-        fs::create_directories(toolsDir);
-        setenv("DOTNET_TOOLS", toolsDir.c_str(), 1);
-
-        // Prepend it to PATH so installed tools are runnable immediately
-        std::string newToolsPath = toolsDir.string() + ":" + getenv("PATH");
-        setenv("PATH", newToolsPath.c_str(), 1);
-        
         fs::path csproj;
         for (auto &entry : fs::directory_iterator(projectRoot)) {
             if (entry.path().extension() == ".csproj") {
@@ -400,7 +388,10 @@ int main(int argc, char *argv[]) {
         for (int i = dotnetArgStart; i < argc; i++)
             newArgs.push_back(argv[i]);
         newArgs.push_back(nullptr);
-
+        
+        std::cerr << "[debug] DOTNET_ROOT=" << getenv("DOTNET_ROOT") << "\n";
+        std::cerr << "[debug] PATH=" << getenv("PATH") << "\n";
+        
         return run_process(projectDotnetBin, newArgs.data(), "dotnet main") ? 0 : 1;
     } catch (const std::exception &e) {
         log(std::string("Error: ") + e.what());
