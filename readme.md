@@ -1,4 +1,4 @@
-# run-node
+# run-dotnet
 
 Run **dotnet** version for your project without installing it system-wide.  
 By default it uses the latest **LTS**, or you can pin to a specific version.
@@ -8,11 +8,13 @@ By default it uses the latest **LTS**, or you can pin to a specific version.
 ./build.sh
 ```
 
-
-Or use [github-exec](https://github.com/zacuke/github-exec) to run this as part of a one-liner.
-
 ## Usage
 ```bash
 ./run-dotnet run Program.cs      
-./run-dotnet 10  run Program.cs   # pin to specific version
+./run-dotnet 10 run Program.cs   # pin to specific version
+```
+
+# Or use [github-exec](https://github.com/zacuke/github-exec) to run this as part of a one-liner.
+```bash
+github-exec zacuke/run-dotnet ef database update
 ```
