@@ -349,6 +349,29 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        // ----------------------------------------------------
+        // Ensure PATH and DOTNET_ROOT are set for child processes
+        // EF/SDK tools spawn "dotnet" again, so they must see it
+        // ----------------------------------------------------
+        std::string oldPath = getenv("PATH") ? getenv("PATH") : "";
+        std::string binDir  = projectDotnetBin.parent_path().string();
+        std::string newPath = binDir + ":" + oldPath;
+        setenv("PATH", newPath.c_str(), 1);
+
+        // DOTNET_ROOT should point to the folder containing 'dotnet'
+        setenv("DOTNET_ROOT", binDir.c_str(), 1);
+
+        // ----------------------------------------------------
+        // Redirect global tool installs into project-local .dotnet/tools
+        // ----------------------------------------------------
+        fs::path toolsDir = dotnetDir / "tools";
+        fs::create_directories(toolsDir);
+        setenv("DOTNET_TOOLS", toolsDir.c_str(), 1);
+
+        // Prepend it to PATH so installed tools are runnable immediately
+        std::string newToolsPath = toolsDir.string() + ":" + getenv("PATH");
+        setenv("PATH", newToolsPath.c_str(), 1);
+        
         fs::path csproj;
         for (auto &entry : fs::directory_iterator(projectRoot)) {
             if (entry.path().extension() == ".csproj") {
